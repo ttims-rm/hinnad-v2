@@ -2,13 +2,8 @@ import axios from "axios";
 
 const GQL = "https://www.loverte.com/graphql";
 
-// --- abifunktsioonid ---
-
 function normalize(str) {
-  return (str || "")
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .trim();
+  return (str || "").toLowerCase().trim();
 }
 
 function extractSizeTokens(text) {
@@ -16,12 +11,10 @@ function extractSizeTokens(text) {
   const re = /(\d+)\s*(ml|g|kg|l)/gi;
   let m;
   while ((m = re.exec(text)) !== null) {
-    out.push((m[1] + m[2]).toLowerCase()); // nt 20g, 50ml
+    out.push((m[1] + m[2]).toLowerCase());
   }
   return out;
 }
-
-// --- GraphQL search ---
 
 async function graphqlSearchProducts(query) {
   const payload = {
@@ -32,14 +25,10 @@ async function graphqlSearchProducts(query) {
             name
             url_key
             version_name
-            small_image {
-              url
-            }
+            small_image { url }
             price_range {
               minimum_price {
-                final_price {
-                  value
-                }
+                final_price { value }
               }
             }
           }
@@ -50,118 +39,75 @@ async function graphqlSearchProducts(query) {
   };
 
   const res = await axios.post(GQL, payload, {
-    headers: {
-      "Content-Type": "application/json",
-      "User-Agent": "Mozilla/5.0"
-    },
+    headers: { "Content-Type": "application/json" },
     timeout: 8000
   });
 
-  const items = res.data?.data?.products?.items || [];
-  return items;
+  return res.data?.data?.products?.items || [];
 }
-
-// --- skoori tooted & vali parim vaste ---
 
 function pickBestMatch(items, query) {
-  if (!items.length) return null;
-
   const qNorm = normalize(query);
-  const sizeTokens = extractSizeTokens(query); // nt ["20g"]
+  const sizeTokens = extractSizeTokens(query);
 
-  function scoreItem(item) {
+  function score(item) {
+    let s = 0;
     const name = normalize(item.name);
     const vname = normalize(item.version_name || "");
-    let score = 0;
 
-    // tugev match nimele
-    if (qNorm && name.includes(qNorm)) score += 50;
+    if (name.includes(qNorm)) s += 50;
 
-    // osalised sõnad
-    const qWords = qNorm.split(" ").filter(Boolean);
+    const qWords = qNorm.split(" ").filter(w => w.length > 2);
     for (const w of qWords) {
-      if (w.length < 3) continue;
-      if (name.includes(w)) score += 3;
-      if (vname.includes(w)) score += 2;
+      if (name.includes(w)) s += 3;
+      if (vname.includes(w)) s += 2;
     }
 
-    // mahu/variandi match (20g, 50ml jms)
-    if (sizeTokens.length) {
-      const nameSizes = extractSizeTokens(item.name || "").concat(
-        extractSizeTokens(item.version_name || "")
-      );
-      for (const st of sizeTokens) {
-        if (nameSizes.includes(st)) {
-          score += 30; // väga tugev vihje õigele variandile
-        }
-      }
+    const itemSizes = [
+      ...extractSizeTokens(item.name || ""),
+      ...extractSizeTokens(item.version_name || "")
+    ];
+    for (const st of sizeTokens) {
+      if (itemSizes.includes(st)) s += 30;
     }
 
-    // eelisesta tooteid, millel on hind olemas
-    const price =
-      item.price_range?.minimum_price?.final_price?.value ?? null;
-    if (price != null) score += 5;
+    const price = item.price_range?.minimum_price?.final_price?.value;
+    if (price != null) s += 5;
 
-    return score;
+    return s;
   }
 
-  let best = null;
-  let bestScore = -Infinity;
-
-  for (const item of items) {
-    const s = scoreItem(item);
-    if (s > bestScore) {
-      bestScore = s;
-      best = item;
-    }
-  }
-
-  return best;
+  return items.reduce((best, item) => {
+    const sc = score(item);
+    if (!best || sc > best.score) return { item, score: sc };
+    return best;
+  }, null)?.item || null;
 }
-
-// --- PUBLIC: üks parim Loverte pakkumine ---
 
 export async function fetchLoverteOffer(query) {
   try {
     const items = await graphqlSearchProducts(query);
-
     if (!items.length) {
-      return {
-        shop: "loverte",
-        price: null,
-        url: null,
-        reason: "no_results"
-      };
+      return { shop: "loverte", price: null, url: null, reason: "no_results" };
     }
 
     const best = pickBestMatch(items, query);
     if (!best) {
-      return {
-        shop: "loverte",
-        price: null,
-        url: null,
-        reason: "no_best_match"
-      };
+      return { shop: "loverte", price: null, url: null, reason: "no_best_match" };
     }
 
-    const price =
-      best.price_range?.minimum_price?.final_price?.value ?? null;
-
-    const url = `https://www.loverte.com/et/${best.url_key}`;
+    const price = best.price_range?.minimum_price?.final_price?.value ?? null;
+    const url = best.url_key ? `https://www.loverte.com/et/${best.url_key}` : null;
 
     return {
       shop: "loverte",
       price,
       url,
-      reason: price != null ? "ok" : "price_not_found"
+      reason: url ? "ok" : "url_not_found"
     };
+
   } catch (err) {
-    console.error("Loverte agent error:", err);
-    return {
-      shop: "loverte",
-      price: null,
-      url: null,
-      reason: "agent_error"
-    };
+    console.error("Loverte offer error:", err);
+    return { shop: "loverte", price: null, url: null, reason: "agent_error" };
   }
 }
