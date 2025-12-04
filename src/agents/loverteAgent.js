@@ -11,7 +11,7 @@ function extractSizeTokens(text) {
   const re = /(\d+)\s*(ml|g|kg|l)/gi;
   let m;
   while ((m = re.exec(text)) !== null) {
-    out.push((m[1] + m[2]).toLowerCase());
+    out.push((m[1] + m[2]).toLowerCase()); // nt 20g, 50ml
   }
   return out;
 }
@@ -50,25 +50,48 @@ function pickBestMatch(items, query) {
   const qNorm = normalize(query);
   const sizeTokens = extractSizeTokens(query);
 
+  let pool = items;
+
+  // Kui päringus on maht (nt 20g, 50ml) → proovi esmalt filtreerida ainult neid,
+  // mille nimes või version_name'is see maht täpselt sees on.
+  if (sizeTokens.length) {
+    const filtered = items.filter((item) => {
+      const itemSizes = [
+        ...extractSizeTokens(item.name || ""),
+        ...extractSizeTokens(item.version_name || "")
+      ];
+      return sizeTokens.every((st) => itemSizes.includes(st));
+    });
+
+    if (filtered.length) {
+      pool = filtered;
+    }
+  }
+
   function score(item) {
     let s = 0;
     const name = normalize(item.name);
     const vname = normalize(item.version_name || "");
 
-    if (name.includes(qNorm)) s += 50;
+    // täpsem nime-match
+    if (name === qNorm) s += 60;
+    else if (name.includes(qNorm)) s += 40;
 
-    const qWords = qNorm.split(" ").filter(w => w.length > 2);
+    const qWords = qNorm.split(" ").filter((w) => w.length > 2);
     for (const w of qWords) {
       if (name.includes(w)) s += 3;
       if (vname.includes(w)) s += 2;
     }
 
-    const itemSizes = [
-      ...extractSizeTokens(item.name || ""),
-      ...extractSizeTokens(item.version_name || "")
-    ];
-    for (const st of sizeTokens) {
-      if (itemSizes.includes(st)) s += 30;
+    // maht – lisab skoori, kui query-s olev maht on ka tootes
+    if (sizeTokens.length) {
+      const itemSizes = [
+        ...extractSizeTokens(item.name || ""),
+        ...extractSizeTokens(item.version_name || "")
+      ];
+      for (const st of sizeTokens) {
+        if (itemSizes.includes(st)) s += 25;
+      }
     }
 
     const price = item.price_range?.minimum_price?.final_price?.value;
@@ -77,27 +100,45 @@ function pickBestMatch(items, query) {
     return s;
   }
 
-  return items.reduce((best, item) => {
-    const sc = score(item);
-    if (!best || sc > best.score) return { item, score: sc };
-    return best;
-  }, null)?.item || null;
+  return (
+    pool.reduce(
+      (best, item) => {
+        const sc = score(item);
+        if (!best || sc > best.score) return { item, score: sc };
+        return best;
+      },
+      null
+    )?.item || null
+  );
 }
 
 export async function fetchLoverteOffer(query) {
   try {
     const items = await graphqlSearchProducts(query);
     if (!items.length) {
-      return { shop: "loverte", price: null, url: null, reason: "no_results" };
+      return {
+        shop: "loverte",
+        price: null,
+        url: null,
+        reason: "no_results"
+      };
     }
 
     const best = pickBestMatch(items, query);
     if (!best) {
-      return { shop: "loverte", price: null, url: null, reason: "no_best_match" };
+      return {
+        shop: "loverte",
+        price: null,
+        url: null,
+        reason: "no_best_match"
+      };
     }
 
-    const price = best.price_range?.minimum_price?.final_price?.value ?? null;
-    const url = best.url_key ? `https://www.loverte.com/et/${best.url_key}` : null;
+    const price =
+      best.price_range?.minimum_price?.final_price?.value ?? null;
+    const url = best.url_key
+      ? `https://www.loverte.com/et/${best.url_key}`
+      : null;
 
     return {
       shop: "loverte",
@@ -105,9 +146,13 @@ export async function fetchLoverteOffer(query) {
       url,
       reason: url ? "ok" : "url_not_found"
     };
-
   } catch (err) {
     console.error("Loverte offer error:", err);
-    return { shop: "loverte", price: null, url: null, reason: "agent_error" };
+    return {
+      shop: "loverte",
+      price: null,
+      url: null,
+      reason: "agent_error"
+    };
   }
 }
