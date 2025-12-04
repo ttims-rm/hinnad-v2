@@ -1,44 +1,40 @@
 import axios from "axios";
 
-const SERP_API_KEY = process.env.SERPAPI_KEY;
+const GQL = "https://www.loverte.com/graphql";
 
-// 1) Leiame Loverte URL SerpAPI kaudu
-async function findLoverteProductUrl(query) {
-  if (!SERP_API_KEY) return null;
+// --- abifunktsioonid ---
 
-  const params = {
-    api_key: SERP_API_KEY,
-    engine: "google",
-    q: `site:loverte.com ${query}`,
-    hl: "et",
-    gl: "ee"
-  };
-
-  const { data } = await axios.get("https://serpapi.com/search", { params });
-  const results = data.organic_results || [];
-
-  const hit = results.find(
-    (r) => r.link && r.link.includes("loverte.com/et/")
-  );
-
-  return hit ? hit.link : null;
+function normalize(str) {
+  return (str || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
-// 2) Võta URL-ist välja url_key (slug)
-function extractUrlKey(url) {
-  const m = url.match(/\/et\/([^\/]+)$/);
-  return m ? m[1] : null;
+function extractSizeTokens(text) {
+  const out = [];
+  const re = /(\d+)\s*(ml|g|kg|l)/gi;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    out.push((m[1] + m[2]).toLowerCase()); // nt 20g, 50ml
+  }
+  return out;
 }
 
-// 3) Loverte päris GraphQL query hinnainfo saamiseks
-async function fetchPriceFromGraphQL(urlKey) {
-  const graphqlUrl = "https://www.loverte.com/graphql";
+// --- GraphQL search ---
 
-  const queryBody = {
+async function graphqlSearchProducts(query) {
+  const payload = {
     query: `
-      query getProductDetailForProductPage($urlKey: String!) {
-        products(filter: { url_key: { eq: $urlKey } }) {
+      query SearchProducts($search: String!) {
+        products(search: $search) {
           items {
+            name
+            url_key
+            version_name
+            small_image {
+              url
+            }
             price_range {
               minimum_price {
                 final_price {
@@ -50,54 +46,114 @@ async function fetchPriceFromGraphQL(urlKey) {
         }
       }
     `,
-    variables: { urlKey }
+    variables: { search: query }
   };
 
-  const response = await axios.post(graphqlUrl, queryBody, {
+  const res = await axios.post(GQL, payload, {
     headers: {
       "Content-Type": "application/json",
       "User-Agent": "Mozilla/5.0"
-    }
+    },
+    timeout: 8000
   });
 
-  const items =
-    response.data?.data?.products?.items || [];
-
-  if (!items.length) return null;
-
-  return items[0]?.price_range?.minimum_price?.final_price?.value ?? null;
+  const items = res.data?.data?.products?.items || [];
+  return items;
 }
 
-// 4) Avalik funktsioon
+// --- skoori tooted & vali parim vaste ---
+
+function pickBestMatch(items, query) {
+  if (!items.length) return null;
+
+  const qNorm = normalize(query);
+  const sizeTokens = extractSizeTokens(query); // nt ["20g"]
+
+  function scoreItem(item) {
+    const name = normalize(item.name);
+    const vname = normalize(item.version_name || "");
+    let score = 0;
+
+    // tugev match nimele
+    if (qNorm && name.includes(qNorm)) score += 50;
+
+    // osalised sõnad
+    const qWords = qNorm.split(" ").filter(Boolean);
+    for (const w of qWords) {
+      if (w.length < 3) continue;
+      if (name.includes(w)) score += 3;
+      if (vname.includes(w)) score += 2;
+    }
+
+    // mahu/variandi match (20g, 50ml jms)
+    if (sizeTokens.length) {
+      const nameSizes = extractSizeTokens(item.name || "").concat(
+        extractSizeTokens(item.version_name || "")
+      );
+      for (const st of sizeTokens) {
+        if (nameSizes.includes(st)) {
+          score += 30; // väga tugev vihje õigele variandile
+        }
+      }
+    }
+
+    // eelisesta tooteid, millel on hind olemas
+    const price =
+      item.price_range?.minimum_price?.final_price?.value ?? null;
+    if (price != null) score += 5;
+
+    return score;
+  }
+
+  let best = null;
+  let bestScore = -Infinity;
+
+  for (const item of items) {
+    const s = scoreItem(item);
+    if (s > bestScore) {
+      bestScore = s;
+      best = item;
+    }
+  }
+
+  return best;
+}
+
+// --- PUBLIC: üks parim Loverte pakkumine ---
+
 export async function fetchLoverteOffer(query) {
   try {
-    const url = await findLoverteProductUrl(query);
-    if (!url) {
+    const items = await graphqlSearchProducts(query);
+
+    if (!items.length) {
       return {
         shop: "loverte",
         price: null,
         url: null,
-        reason: "url_not_found"
+        reason: "no_results"
       };
     }
 
-    const urlKey = extractUrlKey(url);
-    if (!urlKey) {
+    const best = pickBestMatch(items, query);
+    if (!best) {
       return {
         shop: "loverte",
         price: null,
-        url,
-        reason: "url_key_not_found"
+        url: null,
+        reason: "no_best_match"
       };
     }
 
-    const price = await fetchPriceFromGraphQL(urlKey);
+    const price =
+      best.price_range?.minimum_price?.final_price?.value ?? null;
+
+    const url = `https://www.loverte.com/et/${best.url_key}`;
 
     return {
       shop: "loverte",
       price,
       url,
-      reason: price ? "ok" : "price_not_found"
+      reason: price != null ? "ok" : "price_not_found"
     };
   } catch (err) {
     console.error("Loverte agent error:", err);
